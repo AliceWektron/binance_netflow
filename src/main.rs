@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH, Instant};
 use csv::Writer;
 use futures::StreamExt;
 use serde::Deserialize;
-use tokio::sync::{Semaphore, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use num_format::{Locale, ToFormattedString};
@@ -19,6 +19,10 @@ use crossterm::{
 use std::io::{stdout, Write};
 
 use chrono::Utc;
+
+// --- Governor (rate limiting) dependencies ---
+use governor::{Quota, RateLimiter, clock::DefaultClock, state::{NotKeyed, InMemoryState}};
+use std::num::NonZeroU32;
 
 /// Returns a string formatted as milliseconds for the given `Duration`.
 fn format_duration_millis(duration: Duration) -> String {
@@ -208,14 +212,14 @@ async fn fetch_missing_agg_trades(
     market: MarketType,
     start_id: u64,
     end_id: u64,
-    rate_limiter: Arc<Semaphore>,
+    rate_limiter: Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>,
 ) -> Result<Vec<AggTrade>, Box<dyn std::error::Error + Send + Sync>> {
     let mut records = Vec::new();
     let mut current_start = start_id;
     while current_start <= end_id {
-        // Acquire a permit to respect the API rate limit.
-        let _permit = rate_limiter.acquire().await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        // Wait for the rate limiter permit.
+        rate_limiter.until_ready().await;
+
         let url = match market {
             MarketType::Futures => format!(
                 "https://fapi.binance.com/fapi/v1/aggTrades?symbol={}&fromId={}&limit={}",
@@ -301,7 +305,7 @@ async fn run_ws_connection(
     market: MarketType,
     symbol_list: Vec<String>,
     trade_sender: tokio::sync::mpsc::Sender<(MarketType, AggTrade)>,
-    connection_semaphore: Arc<Semaphore>,
+    connection_semaphore: Arc<tokio::sync::Semaphore>,
     symbol_version_rx: tokio::sync::watch::Receiver<usize>,
     current_symbol_version: usize,
 ) {
@@ -340,14 +344,14 @@ async fn run_ws_connection(
                             match serde_json::from_str::<WsAggTradeWrapper>(&text) {
                                 Ok(wrapper) => {
                                     if let Err(e) = trade_sender.send((market, wrapper.data)).await {
-                                        eprintln!("Trade channel send error: {}", e);
+                                        eprintln!("\nTrade channel send error: {}", e);
                                     }
                                 },
-                                Err(e) => eprintln!("WebSocket parse error: {}", e),
+                                Err(e) => eprintln!("\nWebSocket parse error: {}", e),
                             }
                         },
                         Err(e) => {
-                            eprintln!("WebSocket error: {}", e);
+                            eprintln!("\nWebSocket error: {}", e);
                             break;
                         },
                         _ => {}
@@ -355,7 +359,7 @@ async fn run_ws_connection(
                 }
             },
             Err(e) => {
-                eprintln!("WebSocket connection failed: {} (attempt {})", e, reconnect_attempts);
+                eprintln!("\nWebSocket connection failed: {} (attempt {})", e, reconnect_attempts);
                 let delay = BASE_RECONNECT_DELAY * 2u64.pow(reconnect_attempts);
                 tokio::time::sleep(Duration::from_secs(delay)).await;
                 reconnect_attempts = (reconnect_attempts + 1).min(MAX_RECONNECT_ATTEMPTS);
@@ -365,22 +369,6 @@ async fn run_ws_connection(
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
-
-/// Resets the provided rate limiter semaphore every second so that
-/// the number of available permits matches the configured rate limit.
-async fn reset_rate_limiter(semaphore: Arc<Semaphore>, rate_limit: usize) {
-    loop {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let available = semaphore.available_permits();
-        if available < rate_limit {
-            semaphore.add_permits(rate_limit - available);
-        }
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Functions for managing WebSocket connections based on the current symbol list.
-// -----------------------------------------------------------------------------
 
 /// Establishes WebSocket connections for the specified market.
 ///
@@ -393,7 +381,7 @@ async fn spawn_ws_connections(
     market: MarketType,
     symbols: Vec<String>,
     ws_trade_sender: tokio::sync::mpsc::Sender<(MarketType, AggTrade)>,
-    websocket_semaphore: Arc<Semaphore>,
+    websocket_semaphore: Arc<tokio::sync::Semaphore>,
     ws_version_tx: &tokio::sync::watch::Sender<usize>,
 ) {
     // Subscribe to the current version so that connection tasks know when to exit.
@@ -426,13 +414,14 @@ async fn spawn_ws_connections(
 ///   - It updates the shared symbol list,
 ///   - Increments the version in the watch channel (causing old WebSocket connections to stop),
 ///   - And spawns new WebSocket connections using the updated symbol list.
+/// It also prints out which symbols were added or removed.
 async fn refresh_symbols(
     market: MarketType,
     http_client: &reqwest::Client,
     current_symbols: Arc<Mutex<Vec<String>>>,
     ws_version_tx: &tokio::sync::watch::Sender<usize>,
     trade_sender: tokio::sync::mpsc::Sender<(MarketType, AggTrade)>,
-    websocket_semaphore: Arc<Semaphore>,
+    websocket_semaphore: Arc<tokio::sync::Semaphore>,
 ) {
     // Fetch updated symbols for the given market.
     let updated_symbols = match market {
@@ -442,16 +431,37 @@ async fn refresh_symbols(
 
     if let Ok(updated_symbols) = updated_symbols {
         let mut symbols_lock = current_symbols.lock().await;
-        // If the symbol list has changed, update and spawn new WebSocket connections.
+        // Check if the symbol list has changed.
         if *symbols_lock != updated_symbols {
+            let old_symbols = symbols_lock.clone();
             *symbols_lock = updated_symbols.clone();
+
+            // Determine which symbols are new and which were removed.
+            let new_symbols: Vec<String> = updated_symbols
+                .iter()
+                .filter(|symbol| !old_symbols.contains(symbol))
+                .cloned()
+                .collect();
+            let removed_symbols: Vec<String> = old_symbols
+                .iter()
+                .filter(|symbol| !updated_symbols.contains(symbol))
+                .cloned()
+                .collect();
+
             // Increment version so that existing connections become obsolete.
             let new_version = ws_version_tx.borrow().wrapping_add(1);
             ws_version_tx.send(new_version).ok();
 
             // Spawn WebSocket connections using the new symbol list.
             spawn_ws_connections(market, updated_symbols, trade_sender.clone(), websocket_semaphore.clone(), ws_version_tx).await;
-            println!("Found new symbols for {:?}", market);
+
+            // Log which symbols were added or removed using eprintln.
+            if !new_symbols.is_empty() {
+                eprintln!("\nMarket {:?} - Found new symbols: {:?}", market, new_symbols);
+            }
+            if !removed_symbols.is_empty() {
+                eprintln!("\nMarket {:?} - Removed symbols: {:?}", market, removed_symbols);
+            }
         }
     }
 }
@@ -473,7 +483,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Create a channel for trade data coming from both WebSocket and REST (for missing trades).
-    let (trade_data_sender, mut trade_data_receiver) = tokio::sync::mpsc::channel::<(MarketType, AggTrade)>(MAX_BUFFERED_RECORDS);
+    let (trade_data_sender, mut trade_data_receiver) = mpsc::channel::<(MarketType, AggTrade)>(MAX_BUFFERED_RECORDS);
 
     // Shared in-memory storage for aggregated trades, keyed by (symbol, market, minute timestamp).
     let trade_aggregates = Arc::new(Mutex::new(BTreeMap::<(String, MarketType, u64), AggTradeAggregate>::new()));
@@ -483,19 +493,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let agg_trade_tracker = Arc::new(Mutex::new(AggTradeTracker::new()));
     let http_client = reqwest::Client::new();
 
-    // Create rate limiters (using semaphores) for REST API requests for spot and futures.
-    let spot_rate_limiter = Arc::new(Semaphore::new(RATE_LIMIT_REQUESTS_PER_SECOND_SPOT));
-    let futures_rate_limiter = Arc::new(Semaphore::new(RATE_LIMIT_REQUESTS_PER_SECOND_FUTURES));
-
-    // Spawn tasks to reset the rate limiter permits every second.
-    {
-        let spot_rl = spot_rate_limiter.clone();
-        tokio::spawn(reset_rate_limiter(spot_rl, RATE_LIMIT_REQUESTS_PER_SECOND_SPOT));
-    }
-    {
-        let futures_rl = futures_rate_limiter.clone();
-        tokio::spawn(reset_rate_limiter(futures_rl, RATE_LIMIT_REQUESTS_PER_SECOND_FUTURES));
-    }
+    // Create rate limiters (using governor) for REST API requests for spot and futures.
+    let spot_rate_limiter = Arc::new(RateLimiter::direct(
+        Quota::per_second(NonZeroU32::new(RATE_LIMIT_REQUESTS_PER_SECOND_SPOT as u32).unwrap())
+    ));
+    let futures_rate_limiter = Arc::new(RateLimiter::direct(
+        Quota::per_second(NonZeroU32::new(RATE_LIMIT_REQUESTS_PER_SECOND_FUTURES as u32).unwrap())
+    ));
 
     // Clone the trade data sender to be used for missing trades fetched via REST.
     let missing_trade_sender = trade_data_sender.clone();
@@ -633,7 +637,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             // Send each missing trade back into the processing pipeline.
                                             for trade in trades {
                                                 if let Err(e) = missing_trade_sender_clone.send((market, trade)).await {
-                                                    eprintln!("Failed to send missing trade: {}", e);
+                                                    eprintln!("\nFailed to send missing trade: {}", e);
                                                 }
                                             }
                                             metrics_inner.gaps_in_queue.fetch_sub(1, Ordering::Relaxed);
@@ -642,7 +646,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         },
                                         Err(e) => {
                                             let error_str = e.to_string();
-                                            eprintln!("Failed to fetch missing trades: {}. Retrying in {} seconds...", error_str, retry_delay.as_secs());
+                                            eprintln!("\nFailed to fetch missing trades: {}. Retrying in {} seconds...", error_str, retry_delay.as_secs());
                                             // Apply exponential backoff for rate-limit errors.
                                             if error_str.contains("429") {
                                                 retry_delay = std::cmp::min(retry_delay * 2, Duration::from_secs(60));
@@ -734,8 +738,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Create a dedicated channel for receiving trade data from WebSocket connections.
-    let (ws_trade_sender, mut ws_trade_receiver) = tokio::sync::mpsc::channel(MAX_BUFFERED_RECORDS);
-    let websocket_semaphore = Arc::new(Semaphore::new(10));
+    let (ws_trade_sender, mut ws_trade_receiver) = mpsc::channel(MAX_BUFFERED_RECORDS);
+    let websocket_semaphore = Arc::new(tokio::sync::Semaphore::new(10));
 
     // Fetch the initial symbol lists and spawn WebSocket connections.
     {
@@ -808,9 +812,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Forward messages from the WebSocket channel to the main trade data channel.
     while let Some((market, trade_data)) = ws_trade_receiver.recv().await {
         if let Err(e) = trade_data_sender.send((market, trade_data)).await {
-            eprintln!("Trade data channel error: {}", e);
+            eprintln!("\nTrade data channel error: {}", e);
         }
     }
 
     Ok(())
 }
+

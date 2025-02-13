@@ -9,6 +9,7 @@ chrono = { version = "*", default-features = false, features = ["clock"] }
 crossterm = { version = "*", default-features = false }
 csv = "*"
 futures = "*"
+governor = { version = "*", default-features = false, features = ["std"] }
 humantime = "*"
 num-format = "*"
 reqwest = { version = "*", default-features = false, features = ["json", "native-tls"] }
@@ -19,6 +20,6 @@ tokio-tungstenite = { version = "*", features = ["native-tls"] }
 
 [profile.release]
 opt-level = 3
-lto = true     
-panic = "abort"     
+lto = true
+panic = "abort"
 codegen-units = 1
