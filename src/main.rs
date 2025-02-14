@@ -1,8 +1,9 @@
 use std::collections::{HashMap, BTreeMap};
-use std::fs::{self, OpenOptions, File};
-use std::io::{BufReader, BufRead, Write};
+use std::fs::{self, OpenOptions};
+use std::io::{Write};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH, Instant};
+use std::env;
 
 use csv::Writer;
 use futures::StreamExt;
@@ -13,7 +14,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use num_format::{Locale, ToFormattedString};
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 use crossterm::{
     ExecutableCommand,
     terminal::{Clear, ClearType},
@@ -25,6 +26,9 @@ use chrono::Utc;
 // --- Governor (rate limiting) dependencies ---
 use governor::{Quota, RateLimiter, clock::DefaultClock, state::{NotKeyed, InMemoryState}};
 use std::num::NonZeroU32;
+
+/// Global flag to control API request logging.
+static API_LOG_ENABLED: AtomicBool = AtomicBool::new(true);
 
 /// Returns a string formatted as milliseconds for the given `Duration`.
 fn format_duration_millis(duration: Duration) -> String {
@@ -48,15 +52,18 @@ fn format_duration_seconds(duration: Duration) -> String {
     }
 }
 
-/// Logs an HTTP request message with a timestamp to "http_requests.log".
-async fn log_http_request(message: &str) {
+/// Logs an API request message with a timestamp to "api_requests.log".
+async fn log_api_request(message: &str) {
+    if !API_LOG_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
     use tokio::io::AsyncWriteExt;
     let timestamp = Utc::now().to_rfc3339();
     let log_line = format!("{} - {}\n", timestamp, message);
     if let Ok(mut file) = tokio::fs::OpenOptions::new()
         .append(true)
         .create(true)
-        .open("http_requests.log")
+        .open("api_requests.log")
         .await
     {
         let _ = file.write_all(log_line.as_bytes()).await;
@@ -253,11 +260,11 @@ async fn fetch_missing_agg_trades(
                 symbol, current_start, MAX_TRADES_PER_REQUEST
             ),
         };
-        log_http_request(&format!("Sending request: {}", url)).await;
+        log_api_request(&format!("Sending request: {}", url)).await;
         let response = client.get(&url).send().await?;
         let status = response.status();
         let text = response.text().await?;
-        log_http_request(&format!("Received response for {}: status {} Body: {}", url, status, text)).await;
+        log_api_request(&format!("Received response for {}: status {} Body: {}", url, status, text)).await;
         if !status.is_success() {
             return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -628,6 +635,12 @@ fn update_checkpoint_file(checkpoints: &BTreeMap<String, u64>, checkpoint_file: 
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Check for the "--disable-api-log" flag.
+    let args: Vec<String> = env::args().collect();
+    if args.contains(&"--disable-api-log".to_string()) {
+        API_LOG_ENABLED.store(false, Ordering::Relaxed);
+    }
+
     println!("Initializing Binance USDT aggregated trade data stream...");
 
     let process_start_unix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
@@ -863,7 +876,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("Error fetching futures symbols: {}", e);
             vec![]
         });
-        println!("Found {} futures symbols", futures_symbols_fetched.len());
         {
             let mut futures_list_lock = futures_symbols_list.lock().await;
             *futures_list_lock = futures_symbols_fetched.clone();
@@ -873,7 +885,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("Error fetching spot symbols: {}", e);
             vec![]
         });
-        println!("Found {} spot symbols", spot_symbols_fetched.len());
         {
             let mut spot_list_lock = spot_symbols_list.lock().await;
             *spot_list_lock = spot_symbols_fetched.clone();
@@ -967,4 +978,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-
