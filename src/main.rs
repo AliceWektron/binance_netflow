@@ -1,41 +1,179 @@
-use std::collections::{HashMap, BTreeMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{Write};
+use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH, Instant};
-use std::env;
-
-use csv::Writer;
-use futures::StreamExt;
-use serde::{Deserialize, Serialize};
-use serde::de;
-use tokio::sync::{Mutex, mpsc};
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::Message;
-use num_format::{Locale, ToFormattedString};
-
-use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
-use crossterm::{
-    ExecutableCommand,
-    terminal::{Clear, ClearType},
-};
-use std::io::stdout;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
+use csv::Writer;
+use futures::StreamExt;
+use governor::{
+    clock::DefaultClock, 
+    state::{InMemoryState, NotKeyed},
+    Quota, RateLimiter,
+};
+use num_format::{Locale, ToFormattedString};
+use serde::{de, Deserialize, Serialize};
+use tokio::sync::{mpsc, Mutex};
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
 
-// --- Governor (rate limiting) dependencies ---
-use governor::{Quota, RateLimiter, clock::DefaultClock, state::{NotKeyed, InMemoryState}};
-use std::num::NonZeroU32;
+use crossterm::{
+    cursor::MoveTo,
+    ExecutableCommand,
+    terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, size as terminal_size},
+};
+use std::io::stdout;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-/// Global flag to control API request logging.
+// ------------------------
+// Global constants & types
+// ------------------------
+
 static API_LOG_ENABLED: AtomicBool = AtomicBool::new(true);
 
-/// Returns a string formatted as milliseconds for the given `Duration`.
+const MAX_STREAMS_PER_CONNECTION: usize = 100;
+const MAX_RECONNECT_ATTEMPTS: u32 = 5;
+const BASE_RECONNECT_DELAY: u64 = 1;
+const MAX_BUFFERED_RECORDS: usize = 1_000_000;
+const MAX_TRADES_PER_REQUEST: u64 = 1000;
+const RATE_LIMIT_REQUESTS_PER_SECOND_FUTURES: usize = 2;
+const RATE_LIMIT_REQUESTS_PER_SECOND_SPOT: usize = 25;
+const FINALIZATION_BUFFER_SECONDS: u64 = 3;
+
+#[derive(Debug, Deserialize)]
+struct AggTrade {
+    s: String, // symbol
+    p: String, // price as string
+    q: String, // quantity as string
+    m: bool,   // market maker flag
+    #[serde(rename = "a")]
+    agg_trade_id: u64,
+    #[serde(rename = "T")]
+    trade_timestamp: u64,
+    #[serde(flatten)]
+    _extra: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct WsAggTradeWrapper {
+    data: AggTrade,
+}
+
+#[derive(Debug, Deserialize)]
+struct RestAggTrade {
+    #[serde(rename = "a")]
+    agg_trade_id: u64,
+    #[serde(rename = "p")]
+    p: String,
+    #[serde(rename = "q")]
+    q: String,
+    #[serde(rename = "T")]
+    trade_timestamp: u64,
+    #[serde(rename = "m")]
+    m: bool,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+enum MarketType {
+    Futures,
+    Spot,
+}
+
+struct SymbolWriter {
+    writer: Writer<std::fs::File>,
+}
+
+#[derive(Debug, Clone)]
+struct AggTradeAggregate {
+    net_flow: f64,
+    start_atid: Option<u64>,
+    end_atid: Option<u64>,
+    count: usize,
+}
+
+struct AggTradeTracker {
+    last_trade_ids: HashMap<(String, MarketType), u64>,
+}
+
+impl AggTradeTracker {
+    fn new() -> Self {
+        Self {
+            last_trade_ids: HashMap::new(),
+        }
+    }
+
+    fn check_and_update(&mut self, symbol: &str, market: MarketType, agg_trade_id: u64) -> Option<(u64, u64)> {
+        let key = (symbol.to_string(), market);
+        let last_trade = self.last_trade_ids.entry(key).or_insert(agg_trade_id);
+        if agg_trade_id > *last_trade + 1 {
+            let start = *last_trade + 1;
+            let end = agg_trade_id - 1;
+            *last_trade = agg_trade_id;
+            Some((start, end))
+        } else {
+            *last_trade = agg_trade_id.max(*last_trade);
+            None
+        }
+    }
+}
+
+struct Metrics {
+    current_batch_records: AtomicUsize,
+    last_batch_records: AtomicUsize,
+    last_batch_processing_time: Mutex<Duration>,
+    start_time: Instant,
+    missing_gaps: AtomicUsize,
+    gaps_in_queue: AtomicUsize,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Checkpoint {
+    symbol: String,
+    market: String,
+    end_atid_refpt: u64,
+}
+
+fn deserialize_net_flow<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: de::Deserializer<'de>,
+{
+    let s: String = String::deserialize(deserializer)?;
+    let s_clean = s.replace(",", "");
+    s_clean.parse::<f64>().map_err(de::Error::custom)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CsvRecord {
+    timestamp: u64,
+    start_atid: u64,
+    end_atid: u64,
+    #[serde(deserialize_with = "deserialize_net_flow")]
+    net_flow: f64,
+}
+
+// ------------------------
+// Logging support
+// ------------------------
+
+async fn push_log(log_buffer: &Arc<Mutex<VecDeque<String>>>, msg: String) {
+    let mut buf = log_buffer.lock().await;
+    buf.push_back(msg);
+    if buf.len() > 100 {
+        buf.pop_front();
+    }
+}
+
+// ------------------------
+// Utility formatting functions
+// ------------------------
+
 fn format_duration_millis(duration: Duration) -> String {
     format!("{}ms", duration.as_millis())
 }
 
-/// Returns a human-readable string (seconds, minutes, or hours) for the given `Duration`.
 fn format_duration_seconds(duration: Duration) -> String {
     let secs = duration.as_secs();
     if secs < 60 {
@@ -52,7 +190,6 @@ fn format_duration_seconds(duration: Duration) -> String {
     }
 }
 
-/// Logs an API request message with a timestamp to "api_requests.log".
 async fn log_api_request(message: &str) {
     if !API_LOG_ENABLED.load(Ordering::Relaxed) {
         return;
@@ -70,149 +207,9 @@ async fn log_api_request(message: &str) {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Constant definitions for limits, delays, and other configuration.
-// -----------------------------------------------------------------------------
-
-const MAX_STREAMS_PER_CONNECTION: usize = 100;
-const MAX_RECONNECT_ATTEMPTS: u32 = 5;
-const BASE_RECONNECT_DELAY: u64 = 1;
-const MAX_BUFFERED_RECORDS: usize = 1_000_000;
-const MAX_TRADES_PER_REQUEST: u64 = 1000;
-const RATE_LIMIT_REQUESTS_PER_SECOND_FUTURES: usize = 2;
-const RATE_LIMIT_REQUESTS_PER_SECOND_SPOT: usize = 25;
-const FINALIZATION_BUFFER_SECONDS: u64 = 3;
-
-// -----------------------------------------------------------------------------
-// Data structures for trade data and aggregation.
-// -----------------------------------------------------------------------------
-
-/// Represents an aggregated trade record.
-#[derive(Debug, Deserialize)]
-struct AggTrade {
-    s: String, // Symbol (present in WS messages; injected for REST responses)
-    p: String, // Price as a string
-    q: String, // Quantity as a string
-    m: bool,   // Market maker flag.
-    #[serde(rename = "a")]
-    agg_trade_id: u64,
-    #[serde(rename = "T")]
-    trade_timestamp: u64,
-    #[serde(flatten)]
-    _extra: serde_json::Value,
-}
-
-/// Wrapper for aggregated trade data received from the WebSocket.
-#[derive(Debug, Deserialize)]
-struct WsAggTradeWrapper {
-    data: AggTrade,
-}
-
-/// Represents an aggregated trade record from REST responses.
-#[derive(Debug, Deserialize)]
-struct RestAggTrade {
-    #[serde(rename = "a")]
-    agg_trade_id: u64,
-    #[serde(rename = "p")]
-    p: String,
-    #[serde(rename = "q")]
-    q: String,
-    #[serde(rename = "T")]
-    trade_timestamp: u64,
-    #[serde(rename = "m")]
-    m: bool,
-}
-
-/// Represents the two market types.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
-enum MarketType {
-    Futures,
-    Spot,
-}
-
-/// A simple CSV writer wrapper for each symbol.
-struct SymbolWriter {
-    writer: Writer<std::fs::File>,
-}
-
-/// Holds aggregated trade data for a specific minute.
-#[derive(Debug, Clone)]
-struct AggTradeAggregate {
-    net_flow: f64,
-    start_atid: Option<u64>,
-    end_atid: Option<u64>,
-    count: usize,
-}
-
-/// Tracks the last seen trade ID per symbol/market pair.
-struct AggTradeTracker {
-    last_trade_ids: HashMap<(String, MarketType), u64>,
-}
-
-impl AggTradeTracker {
-    fn new() -> Self {
-        Self {
-            last_trade_ids: HashMap::new(),
-        }
-    }
-
-    /// Checks for missing trade IDs. If a gap is found, returns (start, end) of missing IDs.
-    fn check_and_update(&mut self, symbol: &str, market: MarketType, agg_trade_id: u64) -> Option<(u64, u64)> {
-        let key = (symbol.to_string(), market);
-        let last_trade = self.last_trade_ids.entry(key).or_insert(agg_trade_id);
-        if agg_trade_id > *last_trade + 1 {
-            let start = *last_trade + 1;
-            let end = agg_trade_id - 1;
-            *last_trade = agg_trade_id;
-            Some((start, end))
-        } else {
-            *last_trade = agg_trade_id.max(*last_trade);
-            None
-        }
-    }
-}
-
-/// Runtime metrics.
-struct Metrics {
-    current_batch_records: AtomicUsize,
-    last_batch_records: AtomicUsize,
-    last_batch_processing_time: Mutex<Duration>,
-    start_time: Instant,
-    missing_gaps: AtomicUsize,
-    gaps_in_queue: AtomicUsize,
-}
-
-/// A helper struct for CSV checkpoint entries.
-#[derive(Serialize, Deserialize, Debug)]
-struct Checkpoint {
-    symbol: String,
-    market: String,
-    end_atid_refpt: u64,
-}
-
-/// Custom deserializer for net_flow that strips commas.
-fn deserialize_net_flow<'de, D>(deserializer: D) -> Result<f64, D::Error>
-where
-    D: de::Deserializer<'de>,
-{
-    let s: String = String::deserialize(deserializer)?;
-    let s_clean = s.replace(",", "");
-    s_clean.parse::<f64>().map_err(de::Error::custom)
-}
-
-/// A helper struct representing a CSV record.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CsvRecord {
-    timestamp: u64,
-    start_atid: u64,
-    end_atid: u64,
-    #[serde(deserialize_with = "deserialize_net_flow")]
-    net_flow: f64,
-}
-
-// -----------------------------------------------------------------------------
-// Functions for fetching trade data via REST and handling WebSocket connections.
-// -----------------------------------------------------------------------------
+// ------------------------
+// Functions for fetching data & WS handling
+// ------------------------
 
 async fn fetch_usdt_symbols(client: &reqwest::Client, is_futures: bool) -> Result<Vec<String>, reqwest::Error> {
     let url = if is_futures {
@@ -221,18 +218,22 @@ async fn fetch_usdt_symbols(client: &reqwest::Client, is_futures: bool) -> Resul
         "https://api.binance.com/api/v3/exchangeInfo"
     };
 
-    let exchange_info: serde_json::Value = client.get(url)
+    let exchange_info: serde_json::Value = client
+        .get(url)
         .timeout(Duration::from_secs(10))
         .send()
         .await?
         .json()
         .await?;
 
-    Ok(exchange_info["symbols"].as_array().unwrap().iter()
+    Ok(exchange_info["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
         .filter(|s| {
-            s["quoteAsset"].as_str() == Some("USDT") &&
-            s["status"].as_str() == Some("TRADING") &&
-            !s["symbol"].as_str().unwrap().contains("_")
+            s["quoteAsset"].as_str() == Some("USDT")
+                && s["status"].as_str() == Some("TRADING")
+                && !s["symbol"].as_str().unwrap().contains("_")
         })
         .map(|s| s["symbol"].as_str().unwrap().to_lowercase())
         .collect())
@@ -268,7 +269,7 @@ async fn fetch_missing_agg_trades(
         if !status.is_success() {
             return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("HTTP error {}: {}", status, text)
+                format!("HTTP error {}: {}", status, text),
             )));
         }
         let json_value: serde_json::Value = serde_json::from_str(&text)
@@ -276,7 +277,7 @@ async fn fetch_missing_agg_trades(
         if !json_value.is_array() {
             return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("Unexpected JSON format: {}", json_value)
+                format!("Unexpected JSON format: {}", json_value),
             )));
         }
         let rest_records: Vec<RestAggTrade> = serde_json::from_value(json_value)
@@ -286,7 +287,8 @@ async fn fetch_missing_agg_trades(
         }
         if let Some(last_trade) = rest_records.last() {
             if last_trade.agg_trade_id > end_id {
-                let filtered: Vec<RestAggTrade> = rest_records.into_iter()
+                let filtered: Vec<RestAggTrade> = rest_records
+                    .into_iter()
                     .filter(|r| r.agg_trade_id <= end_id)
                     .collect();
                 for r in filtered {
@@ -328,16 +330,19 @@ fn market_str(market: MarketType) -> &'static str {
     }
 }
 
+// Now each spawn that uses the log buffer gets its own clone.
 async fn run_ws_connection(
     market: MarketType,
     symbol_list: Vec<String>,
-    trade_sender: tokio::sync::mpsc::Sender<(MarketType, AggTrade)>,
+    trade_sender: mpsc::Sender<(MarketType, AggTrade)>,
     connection_semaphore: Arc<tokio::sync::Semaphore>,
     symbol_version_rx: tokio::sync::watch::Receiver<usize>,
     current_symbol_version: usize,
+    log_buffer: Arc<Mutex<VecDeque<String>>>,
 ) {
     let mut reconnect_attempts = 0;
-    let stream_paths = symbol_list.iter()
+    let stream_paths = symbol_list
+        .iter()
         .map(|symbol| format!("{}@aggTrade", symbol))
         .collect::<Vec<_>>()
         .join("/");
@@ -364,25 +369,24 @@ async fn run_ws_connection(
                     }
                     match message {
                         Ok(Message::Text(text)) => {
-                            match serde_json::from_str::<WsAggTradeWrapper>(&text) {
-                                Ok(wrapper) => {
-                                    if let Err(e) = trade_sender.send((market, wrapper.data)).await {
-                                        eprintln!("\nTrade channel send error: {}", e);
-                                    }
-                                },
-                                Err(e) => eprintln!("\nWebSocket parse error: {}", e),
+                            if let Ok(wrapper) = serde_json::from_str::<WsAggTradeWrapper>(&text) {
+                                if let Err(e) = trade_sender.send((market, wrapper.data)).await {
+                                    push_log(&log_buffer, format!("Trade channel send error: {}", e)).await;
+                                }
+                            } else {
+                                push_log(&log_buffer, format!("WebSocket parse error: {}", text)).await;
                             }
-                        },
+                        }
+                        Ok(_) => {}
                         Err(e) => {
-                            eprintln!("\nWebSocket error: {}", e);
+                            push_log(&log_buffer, format!("WebSocket error: {}", e)).await;
                             break;
-                        },
-                        _ => {}
+                        }
                     }
                 }
-            },
+            }
             Err(e) => {
-                eprintln!("\nWebSocket connection failed: {} (attempt {})", e, reconnect_attempts);
+                push_log(&log_buffer, format!("WebSocket connection failed: {} (attempt {})", e, reconnect_attempts)).await;
                 let delay = BASE_RECONNECT_DELAY * 2u64.pow(reconnect_attempts);
                 tokio::time::sleep(Duration::from_secs(delay)).await;
                 reconnect_attempts = (reconnect_attempts + 1).min(MAX_RECONNECT_ATTEMPTS);
@@ -396,9 +400,10 @@ async fn run_ws_connection(
 async fn spawn_ws_connections(
     market: MarketType,
     symbols: Vec<String>,
-    ws_trade_sender: tokio::sync::mpsc::Sender<(MarketType, AggTrade)>,
+    ws_trade_sender: mpsc::Sender<(MarketType, AggTrade)>,
     websocket_semaphore: Arc<tokio::sync::Semaphore>,
     ws_version_tx: &tokio::sync::watch::Sender<usize>,
+    log_buffer: Arc<Mutex<VecDeque<String>>>,
 ) {
     let version_rx = ws_version_tx.subscribe();
     let current_version = *version_rx.borrow();
@@ -407,15 +412,20 @@ async fn spawn_ws_connections(
         let trade_sender_inner = ws_trade_sender.clone();
         let ws_semaphore_inner = websocket_semaphore.clone();
         let version_rx_clone = ws_version_tx.subscribe();
+        let log_buf_clone = log_buffer.clone();
 
-        tokio::spawn(run_ws_connection(
-            market,
-            symbols_chunk,
-            trade_sender_inner,
-            ws_semaphore_inner,
-            version_rx_clone,
-            current_version,
-        ));
+        tokio::spawn(async move {
+            run_ws_connection(
+                market,
+                symbols_chunk,
+                trade_sender_inner,
+                ws_semaphore_inner,
+                version_rx_clone,
+                current_version,
+                log_buf_clone,
+            )
+            .await;
+        });
     }
 }
 
@@ -424,8 +434,9 @@ async fn refresh_symbols(
     http_client: &reqwest::Client,
     current_symbols: Arc<Mutex<Vec<String>>>,
     ws_version_tx: &tokio::sync::watch::Sender<usize>,
-    trade_sender: tokio::sync::mpsc::Sender<(MarketType, AggTrade)>,
+    trade_sender: mpsc::Sender<(MarketType, AggTrade)>,
     websocket_semaphore: Arc<tokio::sync::Semaphore>,
+    log_buffer: Arc<Mutex<VecDeque<String>>>,
 ) {
     let updated_symbols = match market {
         MarketType::Futures => fetch_usdt_symbols(http_client, true).await,
@@ -452,23 +463,23 @@ async fn refresh_symbols(
             let new_version = ws_version_tx.borrow().wrapping_add(1);
             ws_version_tx.send(new_version).ok();
 
-            spawn_ws_connections(market, updated_symbols, trade_sender.clone(), websocket_semaphore.clone(), ws_version_tx).await;
+            spawn_ws_connections(market, updated_symbols, trade_sender.clone(), websocket_semaphore.clone(), ws_version_tx, log_buffer.clone()).await;
 
             if !new_symbols.is_empty() {
-                eprintln!("\nMarket {:?} - Found new symbols: {:?}", market, new_symbols);
+                push_log(&log_buffer, format!("Market {:?} - Found new symbols: {:?}", market, new_symbols)).await;
             }
             if !removed_symbols.is_empty() {
-                eprintln!("\nMarket {:?} - Removed symbols: {:?}", market, removed_symbols);
+                push_log(&log_buffer, format!("Market {:?} - Removed symbols: {:?}", market, removed_symbols)).await;
             }
         }
     }
 }
 
-// -----------------------------------------------------------------------------
-// Failsafe Backfill Mechanism: CSV scanning, gap detection, REST backfill, and checkpointing.
-// -----------------------------------------------------------------------------
+// ------------------------
+// CSV & checkpoint processing functions (update error types to be Send+Sync)
+// ------------------------
 
-fn read_csv_records(file_path: &str) -> Result<Vec<CsvRecord>, Box<dyn std::error::Error>> {
+fn read_csv_records(file_path: &str) -> Result<Vec<CsvRecord>, Box<dyn std::error::Error + Send + Sync>> {
     let mut reader = csv::Reader::from_path(file_path)?;
     let mut records = Vec::new();
     for result in reader.deserialize() {
@@ -478,9 +489,7 @@ fn read_csv_records(file_path: &str) -> Result<Vec<CsvRecord>, Box<dyn std::erro
     Ok(records)
 }
 
-/// Scans a CSV file for gaps between consecutive aggregated records.
-/// (This scans based on trade IDs.)
-fn scan_csv_for_gaps(file_path: &str) -> Result<(u64, Vec<(u64, u64)>), Box<dyn std::error::Error>> {
+fn scan_csv_for_gaps(file_path: &str) -> Result<(u64, Vec<(u64, u64)>), Box<dyn std::error::Error + Send + Sync>> {
     let records = read_csv_records(file_path)?;
     let mut gaps = Vec::new();
     let mut prev_end: Option<u64> = None;
@@ -497,7 +506,6 @@ fn scan_csv_for_gaps(file_path: &str) -> Result<(u64, Vec<(u64, u64)>), Box<dyn 
     Ok((checkpoint, gaps))
 }
 
-/// Aggregates a list of missing AggTrade records by minute.
 fn aggregate_missing_trades(trades: &[AggTrade]) -> BTreeMap<u64, AggTradeAggregate> {
     let mut aggregates = BTreeMap::new();
     for trade in trades {
@@ -525,16 +533,12 @@ fn aggregate_missing_trades(trades: &[AggTrade]) -> BTreeMap<u64, AggTradeAggreg
     aggregates
 }
 
-/// Inserts missing aggregate rows into the CSV file without merging live data.
-/// For each new minute from gap-filling that does not already exist in the CSV, we add a new row.
-fn merge_and_update_csv(file_path: &str, new_aggregates: &BTreeMap<u64, AggTradeAggregate>) -> Result<(), Box<dyn std::error::Error>> {
+fn merge_and_update_csv(file_path: &str, new_aggregates: &BTreeMap<u64, AggTradeAggregate>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let existing = read_csv_records(file_path)?;
-    // Build a map: minute -> CsvRecord from existing data.
     let mut existing_map: HashMap<u64, CsvRecord> = HashMap::new();
     for rec in existing {
         existing_map.insert(rec.timestamp, rec);
     }
-    // Insert new aggregates only if that minute is not already present.
     for (&minute, agg) in new_aggregates {
         if !existing_map.contains_key(&minute) {
             let new_record = CsvRecord {
@@ -546,7 +550,6 @@ fn merge_and_update_csv(file_path: &str, new_aggregates: &BTreeMap<u64, AggTrade
             existing_map.insert(minute, new_record);
         }
     }
-    // Convert to sorted vector.
     let mut merged: Vec<CsvRecord> = existing_map.into_iter().map(|(_, rec)| rec).collect();
     merged.sort_by_key(|r| r.timestamp);
     let file = OpenOptions::new().write(true).truncate(true).open(file_path)?;
@@ -573,32 +576,30 @@ fn merge_and_update_csv(file_path: &str, new_aggregates: &BTreeMap<u64, AggTrade
     Ok(())
 }
 
-/// Processes a CSV file for a given symbol and market:
-/// It scans for gaps, queries the API for missing trades, aggregates them, and inserts
-/// new rows only for minute boundaries that are missing.
 async fn process_csv_file(
     file_path: &str,
     symbol: &str,
     market: MarketType,
     http_client: reqwest::Client,
     rate_limiter: Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>,
-) -> Result<u64, Box<dyn std::error::Error>> {
+    log_buffer: Arc<Mutex<VecDeque<String>>>,
+) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
     let (checkpoint, gaps) = scan_csv_for_gaps(file_path)?;
     if gaps.is_empty() {
         return Ok(checkpoint);
     }
     let mut combined_missing_trades = Vec::new();
     for (missing_start, missing_end) in gaps {
-        eprintln!("Found gap in {} {}: {} to {}", market_str(market), symbol, missing_start, missing_end);
+        push_log(&log_buffer, format!("Found gap in {} {}: {} to {}", market_str(market), symbol, missing_start, missing_end)).await;
         let mut retry_delay = Duration::from_secs(5);
         loop {
             match fetch_missing_agg_trades(&http_client, symbol, market, missing_start, missing_end, rate_limiter.clone()).await {
                 Ok(trades) => {
                     combined_missing_trades.extend(trades);
                     break;
-                },
+                }
                 Err(e) => {
-                    eprintln!("Error fetching missing trades for {} {}: {}. Retrying in {} seconds...", market_str(market), symbol, e, retry_delay.as_secs());
+                    push_log(&log_buffer, format!("Error fetching missing trades for {} {}: {}. Retrying in {} seconds...", market_str(market), symbol, e, retry_delay.as_secs())).await;
                     if e.to_string().contains("429") {
                         retry_delay = std::cmp::min(retry_delay * 2, Duration::from_secs(60));
                     } else {
@@ -615,8 +616,7 @@ async fn process_csv_file(
     Ok(new_checkpoint)
 }
 
-/// Writes checkpoint data to a JSON file.
-fn update_checkpoint_file(checkpoints: &BTreeMap<String, u64>, checkpoint_file: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn update_checkpoint_file(checkpoints: &BTreeMap<String, u64>, checkpoint_file: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let checkpoint_vec: Vec<Checkpoint> = checkpoints.iter().map(|(key, &end_atid)| {
         let mut parts = key.split(':');
         let symbol = parts.next().unwrap_or_default().to_string();
@@ -629,23 +629,88 @@ fn update_checkpoint_file(checkpoints: &BTreeMap<String, u64>, checkpoint_file: 
     Ok(())
 }
 
-// -----------------------------------------------------------------------------
-// Main application entry point.
-// -----------------------------------------------------------------------------
+// ------------------------
+// UI Rendering Task
+// ------------------------
+
+async fn ui_render_loop(
+    metrics: Arc<Metrics>,
+    futures_symbols_list: Arc<Mutex<Vec<String>>>,
+    spot_symbols_list: Arc<Mutex<Vec<String>>>,
+    next_symbol_refresh_time: Arc<Mutex<SystemTime>>,
+    log_buffer: Arc<Mutex<VecDeque<String>>>,
+) -> crossterm::Result<()> {
+    let mut stdout = stdout();
+    loop {
+        let (cols, rows) = terminal_size()?;
+        stdout.execute(Clear(ClearType::All))?;
+        let logs = {
+            let buf = log_buffer.lock().await;
+            let total = buf.len();
+            let start = if total > (rows as usize - 1) { total - (rows as usize - 1) } else { 0 };
+            buf.iter().skip(start).cloned().collect::<Vec<_>>()
+        };
+        for (i, line) in logs.iter().enumerate() {
+            stdout.execute(MoveTo(0, i as u16))?;
+            write!(stdout, "{:<width$}", line, width = cols as usize)?;
+        }
+        let elapsed = Instant::now().duration_since(metrics.start_time);
+        let formatted_elapsed = format_duration_seconds(elapsed);
+        let last_batch = metrics.last_batch_records.load(Ordering::Relaxed);
+        let proc_time = *metrics.last_batch_processing_time.lock().await;
+        let formatted_proc_time = format_duration_millis(proc_time);
+        let missing = metrics.missing_gaps.load(Ordering::Relaxed);
+        let gaps = metrics.gaps_in_queue.load(Ordering::Relaxed);
+        let next_refresh_time = {
+            let lock = next_symbol_refresh_time.lock().await;
+            *lock
+        };
+        let now_sys = SystemTime::now();
+        let countdown = if next_refresh_time > now_sys {
+            next_refresh_time.duration_since(now_sys).unwrap()
+        } else {
+            Duration::from_secs(0)
+        };
+        let mins = countdown.as_secs() / 60;
+        let secs = countdown.as_secs() % 60;
+        let futures_count = futures_symbols_list.lock().await.len();
+        let spot_count = spot_symbols_list.lock().await.len();
+        let status_line = format!(
+            "Elapsed: {} | Last Batch: {} records | Proc Time: {} | Missing Gaps: {} | Gaps in Queue: {} | Refresh in: {:02}m:{:02}s | Futures: {} | Spot: {}",
+            formatted_elapsed, last_batch, formatted_proc_time, missing, gaps, mins, secs, futures_count, spot_count
+        );
+        stdout.execute(MoveTo(0, rows - 1))?;
+        write!(stdout, "{:<width$}", status_line, width = cols as usize)?;
+        stdout.flush()?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+// ------------------------
+// Main entry point
+// ------------------------
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Check for the "--disable-api-log" flag.
+    let mut stdout = stdout();
+    stdout.execute(EnterAlternateScreen)?;
+    
+    // Create shared log buffer.
+    let log_buffer = Arc::new(Mutex::new(VecDeque::new()));
+
+    // Clone for UI spawn.
+    let ui_log_buffer = log_buffer.clone();
+
     let args: Vec<String> = env::args().collect();
     if args.contains(&"--disable-api-log".to_string()) {
         API_LOG_ENABLED.store(false, Ordering::Relaxed);
     }
 
-    println!("Initializing Binance USDT aggregated trade data stream...");
+    push_log(&log_buffer, "Initializing Binance USDT aggregated trade data stream...".to_string()).await;
 
     let process_start_unix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let next_minute_boundary = ((process_start_unix / 60) + 1) * 60;
-    println!("Process start UNIX time: {}. Next full minute boundary: {}", process_start_unix, next_minute_boundary);
+    push_log(&log_buffer, format!("Process start UNIX time: {}. Next full minute boundary: {}", process_start_unix, next_minute_boundary)).await;
 
     let (trade_data_sender, mut trade_data_receiver) = mpsc::channel::<(MarketType, AggTrade)>(MAX_BUFFERED_RECORDS);
 
@@ -678,44 +743,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (spot_ws_version_tx, _) = tokio::sync::watch::channel(0);
     let next_symbol_refresh_time = Arc::new(Mutex::new(SystemTime::now() + Duration::from_secs(3600)));
 
+    // Spawn UI rendering loop.
     {
-        let metrics = metrics.clone();
-        let futures_symbols_list = futures_symbols_list.clone();
-        let spot_symbols_list = spot_symbols_list.clone();
-        let next_symbol_refresh_time = next_symbol_refresh_time.clone();
+        let metrics_clone = metrics.clone();
+        let futures_symbols_list_clone = futures_symbols_list.clone();
+        let spot_symbols_list_clone = spot_symbols_list.clone();
+        let next_symbol_refresh_time_clone = next_symbol_refresh_time.clone();
+        let ui_log_buffer_clone = ui_log_buffer.clone();
         tokio::spawn(async move {
-            let mut stdout = stdout();
-            loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                let elapsed = Instant::now().duration_since(metrics.start_time);
-                let last_batch = metrics.last_batch_records.load(Ordering::Relaxed);
-                let proc_time = *metrics.last_batch_processing_time.lock().await;
-                let missing = metrics.missing_gaps.load(Ordering::Relaxed);
-                let gaps = metrics.gaps_in_queue.load(Ordering::Relaxed);
-                let formatted_elapsed = format_duration_seconds(elapsed);
-                let formatted_proc_time = format_duration_millis(proc_time);
-                let next_refresh_time = {
-                    let lock = next_symbol_refresh_time.lock().await;
-                    *lock
-                };
-                let now_sys = SystemTime::now();
-                let countdown = if next_refresh_time > now_sys {
-                    next_refresh_time.duration_since(now_sys).unwrap()
-                } else {
-                    Duration::from_secs(0)
-                };
-                let mins = countdown.as_secs() / 60;
-                let secs = countdown.as_secs() % 60;
-                let futures_count = futures_symbols_list.lock().await.len();
-                let spot_count = spot_symbols_list.lock().await.len();
-                stdout.execute(Clear(ClearType::CurrentLine)).ok();
-                print!("\rElapsed: {} | Last Batch: {} records | Proc Time: {} | Missing Gaps: {} | Gaps in Queue: {} | Refresh in: {:02}m:{:02}s | Futures: {} | Spot: {}",
-                    formatted_elapsed, last_batch, formatted_proc_time, missing, gaps, mins, secs, futures_count, spot_count);
-                stdout.flush().ok();
+            if let Err(e) = ui_render_loop(metrics_clone, futures_symbols_list_clone, spot_symbols_list_clone, next_symbol_refresh_time_clone, ui_log_buffer_clone).await {
+                eprintln!("UI render loop error: {}", e);
             }
         });
     }
 
+    // Spawn task for processing trades.
     {
         let start_minute_boundary = next_minute_boundary;
         let trade_aggregates = trade_aggregates.clone();
@@ -726,6 +768,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let futures_rate_limiter = futures_rate_limiter.clone();
         let spot_rate_limiter = spot_rate_limiter.clone();
         let missing_trade_sender = missing_trade_sender.clone();
+        let proc_log_buffer = log_buffer.clone();
         tokio::spawn(async move {
             let mut flush_interval = tokio::time::interval(Duration::from_secs(6));
             loop {
@@ -762,7 +805,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         let mut tracker_lock = agg_trade_tracker.lock().await;
                         if let Some((missing_start, missing_end)) = tracker_lock.check_and_update(&trade_data.s, market, trade_data.agg_trade_id) {
-                            eprintln!("Detected gap in {} {}: {} to {}", market_str(market), trade_data.s, missing_start, missing_end);
+                            push_log(&proc_log_buffer, format!("Detected gap in {} {}: {} to {}", market_str(market), trade_data.s, missing_start, missing_end)).await;
                             metrics_clone.missing_gaps.fetch_add(1, Ordering::Relaxed);
                             metrics_clone.gaps_in_queue.fetch_add(1, Ordering::Relaxed);
                             let http_client_inner = http_client.clone();
@@ -773,6 +816,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             };
                             let missing_trade_sender_clone = missing_trade_sender.clone();
                             let metrics_inner = metrics_clone.clone();
+                            let proc_log_buffer_inner = proc_log_buffer.clone();
                             tokio::spawn(async move {
                                 let mut retry_delay = Duration::from_secs(5);
                                 loop {
@@ -780,7 +824,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         Ok(trades) => {
                                             for trade in trades {
                                                 if let Err(e) = missing_trade_sender_clone.send((market, trade)).await {
-                                                    eprintln!("\nFailed to send missing trade: {}", e);
+                                                    push_log(&proc_log_buffer_inner, format!("Failed to send missing trade: {}", e)).await;
                                                 }
                                             }
                                             metrics_inner.gaps_in_queue.fetch_sub(1, Ordering::Relaxed);
@@ -788,9 +832,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             break;
                                         },
                                         Err(e) => {
-                                            let error_str = e.to_string();
-                                            eprintln!("\nFailed to fetch missing trades: {}. Retrying in {} seconds...", error_str, retry_delay.as_secs());
-                                            if error_str.contains("429") {
+                                            push_log(&proc_log_buffer_inner, format!("Failed to fetch missing trades: {}. Retrying in {} seconds...", e, retry_delay.as_secs())).await;
+                                            if e.to_string().contains("429") {
                                                 retry_delay = std::cmp::min(retry_delay * 2, Duration::from_secs(60));
                                             } else {
                                                 retry_delay = Duration::from_secs(5);
@@ -870,19 +913,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let spot_symbols_list = spot_symbols_list.clone();
         let futures_ws_version_tx = futures_ws_version_tx.clone();
         let spot_ws_version_tx = spot_ws_version_tx.clone();
-
-        println!("Fetching futures symbols...");
+        let ws_log_buffer = log_buffer.clone();
+        push_log(&ws_log_buffer, "Fetching futures symbols...".to_string()).await;
         let futures_symbols_fetched = fetch_usdt_symbols(&http_client, true).await.unwrap_or_else(|e| {
-            eprintln!("Error fetching futures symbols: {}", e);
+            // Log error and return empty vector.
+            futures::executor::block_on(push_log(&ws_log_buffer, format!("Error fetching futures symbols: {}", e)));
             vec![]
         });
         {
             let mut futures_list_lock = futures_symbols_list.lock().await;
             *futures_list_lock = futures_symbols_fetched.clone();
         }
-        println!("Fetching spot symbols...");
+        push_log(&ws_log_buffer, "Fetching spot symbols...".to_string()).await;
         let spot_symbols_fetched = fetch_usdt_symbols(&http_client, false).await.unwrap_or_else(|e| {
-            eprintln!("Error fetching spot symbols: {}", e);
+            futures::executor::block_on(push_log(&ws_log_buffer, format!("Error fetching spot symbols: {}", e)));
             vec![]
         });
         {
@@ -890,10 +934,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             *spot_list_lock = spot_symbols_fetched.clone();
         }
         {
-            spawn_ws_connections(MarketType::Futures, futures_symbols_fetched, ws_trade_sender.clone(), websocket_semaphore.clone(), &futures_ws_version_tx).await;
+            spawn_ws_connections(MarketType::Futures, futures_symbols_fetched, ws_trade_sender.clone(), websocket_semaphore.clone(), &futures_ws_version_tx, ws_log_buffer.clone()).await;
         }
         {
-            spawn_ws_connections(MarketType::Spot, spot_symbols_fetched, ws_trade_sender.clone(), websocket_semaphore.clone(), &spot_ws_version_tx).await;
+            spawn_ws_connections(MarketType::Spot, spot_symbols_fetched, ws_trade_sender.clone(), websocket_semaphore.clone(), &spot_ws_version_tx, ws_log_buffer.clone()).await;
         }
     }
 
@@ -906,6 +950,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let next_symbol_refresh_time = next_symbol_refresh_time.clone();
         let trade_sender_clone = ws_trade_sender.clone();
         let websocket_semaphore = websocket_semaphore.clone();
+        let refresh_log_buffer = log_buffer.clone();
         tokio::spawn(async move {
             loop {
                 let now = SystemTime::now();
@@ -918,8 +963,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let wait_duration = refresh_time.duration_since(SystemTime::now()).unwrap_or(Duration::from_secs(0));
                 tokio::time::sleep(wait_duration).await;
-                refresh_symbols(MarketType::Futures, &http_client, futures_symbols_list.clone(), &futures_ws_version_tx, trade_sender_clone.clone(), websocket_semaphore.clone()).await;
-                refresh_symbols(MarketType::Spot, &http_client, spot_symbols_list.clone(), &spot_ws_version_tx, trade_sender_clone.clone(), websocket_semaphore.clone()).await;
+                refresh_symbols(MarketType::Futures, &http_client, futures_symbols_list.clone(), &futures_ws_version_tx, trade_sender_clone.clone(), websocket_semaphore.clone(), refresh_log_buffer.clone()).await;
+                refresh_symbols(MarketType::Spot, &http_client, spot_symbols_list.clone(), &spot_ws_version_tx, trade_sender_clone.clone(), websocket_semaphore.clone(), refresh_log_buffer.clone()).await;
             }
         });
     }
@@ -928,6 +973,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let http_client = http_client.clone();
         let futures_rate_limiter_clone = futures_rate_limiter.clone();
         let spot_rate_limiter_clone = spot_rate_limiter.clone();
+        let checkpoint_log_buffer = log_buffer.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(120)).await;
             let mut checkpoints: BTreeMap<String, u64> = BTreeMap::new();
@@ -947,13 +993,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         MarketType::Futures => futures_rate_limiter_clone.clone(),
                                         MarketType::Spot => spot_rate_limiter_clone.clone(),
                                     };
-                                    match process_csv_file(&file_path, &symbol, *market, http_client.clone(), rate_limiter).await {
+                                    match process_csv_file(&file_path, &symbol, *market, http_client.clone(), rate_limiter, checkpoint_log_buffer.clone()).await {
                                         Ok(new_checkpoint) => {
                                             checkpoints.insert(format!("{}:{}", symbol, market_str(*market)), new_checkpoint);
-                                            eprintln!("Updated checkpoint for {} {}: {}", market_str(*market), symbol, new_checkpoint);
+                                            push_log(&checkpoint_log_buffer, format!("Updated checkpoint for {} {}: {}", market_str(*market), symbol, new_checkpoint)).await;
                                         },
                                         Err(e) => {
-                                            eprintln!("Error processing file {}: {}", file_path, e);
+                                            push_log(&checkpoint_log_buffer, format!("Error processing file {}: {}", file_path, e)).await;
                                         }
                                     }
                                 }
@@ -963,18 +1009,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             if let Err(e) = update_checkpoint_file(&checkpoints, "checkpoint.json") {
-                eprintln!("Error updating checkpoint.json: {}", e);
+                push_log(&checkpoint_log_buffer, format!("Error updating checkpoint.json: {}", e)).await;
             } else {
-                eprintln!("Checkpoint file updated.");
+                push_log(&checkpoint_log_buffer, "Checkpoint file updated.".to_string()).await;
             }
         });
     }
 
     while let Some((market, trade_data)) = ws_trade_receiver.recv().await {
         if let Err(e) = trade_data_sender.send((market, trade_data)).await {
-            eprintln!("\nTrade data channel error: {}", e);
+            push_log(&log_buffer, format!("Trade data channel error: {}", e)).await;
         }
     }
 
+    stdout.execute(LeaveAlternateScreen)?;
     Ok(())
 }
