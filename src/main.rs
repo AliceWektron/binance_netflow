@@ -156,7 +156,7 @@ struct CsvRecord {
 }
 
 // ------------------------
-// Logging support
+// Logging Support & Utility Functions
 // ------------------------
 
 async fn push_log(log_buffer: &Arc<Mutex<VecDeque<String>>>, msg: String) {
@@ -166,10 +166,6 @@ async fn push_log(log_buffer: &Arc<Mutex<VecDeque<String>>>, msg: String) {
         buf.pop_front();
     }
 }
-
-// ------------------------
-// Utility formatting functions
-// ------------------------
 
 fn format_duration_millis(duration: Duration) -> String {
     format!("{}ms", duration.as_millis())
@@ -191,6 +187,18 @@ fn format_duration_seconds(duration: Duration) -> String {
     }
 }
 
+fn format_net_flow(value: f64) -> String {
+    let net_flow_str = format!("{:.2}", value);
+    let parts: Vec<&str> = net_flow_str.split('.').collect();
+    let int_part = parts[0].parse::<i64>().unwrap_or(0);
+    let formatted_int = int_part.to_formatted_string(&Locale::en);
+    if parts.len() > 1 {
+        format!("{}.{}", formatted_int, parts[1])
+    } else {
+        formatted_int
+    }
+}
+
 async fn log_api_request(message: &str) {
     if !API_LOG_ENABLED.load(Ordering::Relaxed) {
         return;
@@ -209,36 +217,8 @@ async fn log_api_request(message: &str) {
 }
 
 // ------------------------
-// Functions for fetching data & WS handling
+// Data Fetching & WebSocket Handling Functions
 // ------------------------
-
-async fn fetch_usdt_symbols(client: &reqwest::Client, is_futures: bool) -> Result<Vec<String>, reqwest::Error> {
-    let url = if is_futures {
-        "https://fapi.binance.com/fapi/v1/exchangeInfo"
-    } else {
-        "https://api.binance.com/api/v3/exchangeInfo"
-    };
-
-    let exchange_info: serde_json::Value = client
-        .get(url)
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await?
-        .json()
-        .await?;
-
-    Ok(exchange_info["symbols"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|s| {
-            s["quoteAsset"].as_str() == Some("USDT")
-                && s["status"].as_str() == Some("TRADING")
-                && !s["symbol"].as_str().unwrap().contains("_")
-        })
-        .map(|s| s["symbol"].as_str().unwrap().to_lowercase())
-        .collect())
-}
 
 async fn fetch_missing_agg_trades(
     client: &reqwest::Client,
@@ -324,6 +304,34 @@ async fn fetch_missing_agg_trades(
     Ok(records)
 }
 
+async fn fetch_usdt_symbols(client: &reqwest::Client, is_futures: bool) -> Result<Vec<String>, reqwest::Error> {
+    let url = if is_futures {
+        "https://fapi.binance.com/fapi/v1/exchangeInfo"
+    } else {
+        "https://api.binance.com/api/v3/exchangeInfo"
+    };
+
+    let exchange_info: serde_json::Value = client
+        .get(url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    Ok(exchange_info["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| {
+            s["quoteAsset"].as_str() == Some("USDT")
+                && s["status"].as_str() == Some("TRADING")
+                && !s["symbol"].as_str().unwrap().contains("_")
+        })
+        .map(|s| s["symbol"].as_str().unwrap().to_lowercase())
+        .collect())
+}
+
 fn market_str(market: MarketType) -> &'static str {
     match market {
         MarketType::Futures => "futures",
@@ -338,7 +346,51 @@ fn market_str_short(market: MarketType) -> &'static str {
     }
 }
 
-// Now each spawn that uses the log buffer gets its own clone.
+async fn refresh_symbols(
+    market: MarketType,
+    http_client: &reqwest::Client,
+    current_symbols: Arc<Mutex<Vec<String>>>,
+    ws_version_tx: &tokio::sync::watch::Sender<usize>,
+    trade_sender: mpsc::Sender<(MarketType, AggTrade)>,
+    websocket_semaphore: Arc<tokio::sync::Semaphore>,
+    log_buffer: Arc<Mutex<VecDeque<String>>>,
+) {
+    let updated_symbols = match market {
+        MarketType::Futures => fetch_usdt_symbols(http_client, true).await,
+        MarketType::Spot => fetch_usdt_symbols(http_client, false).await,
+    };
+
+    if let Ok(updated_symbols) = updated_symbols {
+        let mut symbols_lock = current_symbols.lock().await;
+        if *symbols_lock != updated_symbols {
+            let old_symbols = std::mem::replace(&mut *symbols_lock, updated_symbols.clone());
+
+            let new_symbols: Vec<String> = symbols_lock
+                .iter()
+                .filter(|symbol| !old_symbols.contains(symbol))
+                .cloned()
+                .collect();
+            let removed_symbols: Vec<String> = old_symbols
+                .iter()
+                .filter(|symbol| !symbols_lock.contains(symbol))
+                .cloned()
+                .collect();
+
+            let new_version = ws_version_tx.borrow().wrapping_add(1);
+            ws_version_tx.send(new_version).ok();
+
+            spawn_ws_connections(market, updated_symbols, trade_sender.clone(), websocket_semaphore.clone(), ws_version_tx, log_buffer.clone()).await;
+
+            if !new_symbols.is_empty() {
+                push_log(&log_buffer, format!("Market {:?} - Found new symbols: {:?}", market, new_symbols)).await;
+            }
+            if !removed_symbols.is_empty() {
+                push_log(&log_buffer, format!("Market {:?} - Removed symbols: {:?}", market, removed_symbols)).await;
+            }
+        }
+    }
+}
+
 async fn run_ws_connection(
     market: MarketType,
     symbol_list: Vec<String>,
@@ -437,82 +489,9 @@ async fn spawn_ws_connections(
     }
 }
 
-async fn refresh_symbols(
-    market: MarketType,
-    http_client: &reqwest::Client,
-    current_symbols: Arc<Mutex<Vec<String>>>,
-    ws_version_tx: &tokio::sync::watch::Sender<usize>,
-    trade_sender: mpsc::Sender<(MarketType, AggTrade)>,
-    websocket_semaphore: Arc<tokio::sync::Semaphore>,
-    log_buffer: Arc<Mutex<VecDeque<String>>>,
-) {
-    let updated_symbols = match market {
-        MarketType::Futures => fetch_usdt_symbols(http_client, true).await,
-        MarketType::Spot => fetch_usdt_symbols(http_client, false).await,
-    };
-
-    if let Ok(updated_symbols) = updated_symbols {
-        let mut symbols_lock = current_symbols.lock().await;
-        if *symbols_lock != updated_symbols {
-            let old_symbols = symbols_lock.clone();
-            *symbols_lock = updated_symbols.clone();
-
-            let new_symbols: Vec<String> = updated_symbols
-                .iter()
-                .filter(|symbol| !old_symbols.contains(symbol))
-                .cloned()
-                .collect();
-            let removed_symbols: Vec<String> = old_symbols
-                .iter()
-                .filter(|symbol| !updated_symbols.contains(symbol))
-                .cloned()
-                .collect();
-
-            let new_version = ws_version_tx.borrow().wrapping_add(1);
-            ws_version_tx.send(new_version).ok();
-
-            spawn_ws_connections(market, updated_symbols, trade_sender.clone(), websocket_semaphore.clone(), ws_version_tx, log_buffer.clone()).await;
-
-            if !new_symbols.is_empty() {
-                push_log(&log_buffer, format!("Market {:?} - Found new symbols: {:?}", market, new_symbols)).await;
-            }
-            if !removed_symbols.is_empty() {
-                push_log(&log_buffer, format!("Market {:?} - Removed symbols: {:?}", market, removed_symbols)).await;
-            }
-        }
-    }
-}
-
 // ------------------------
-// CSV & checkpoint processing functions (with explicit memory release)
+// CSV & Checkpoint Processing Functions
 // ------------------------
-
-fn read_csv_records(file_path: &str) -> Result<Vec<CsvRecord>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut reader = csv::Reader::from_path(file_path)?;
-    let mut records = Vec::new();
-    for result in reader.deserialize() {
-        let record: CsvRecord = result?;
-        records.push(record);
-    }
-    Ok(records)
-}
-
-fn scan_csv_for_gaps(file_path: &str) -> Result<(u64, Vec<(u64, u64)>), Box<dyn std::error::Error + Send + Sync>> {
-    let records = read_csv_records(file_path)?;
-    let mut gaps = Vec::new();
-    let mut prev_end: Option<u64> = None;
-    let mut checkpoint = 0;
-    for record in records.iter() {
-        if let Some(prev) = prev_end {
-            if record.start_atid > prev + 1 {
-                gaps.push((prev + 1, record.start_atid - 1));
-            }
-        }
-        prev_end = Some(record.end_atid);
-        checkpoint = record.end_atid;
-    }
-    Ok((checkpoint, gaps))
-}
 
 fn aggregate_missing_trades(trades: &[AggTrade]) -> BTreeMap<u64, AggTradeAggregate> {
     let mut aggregates = BTreeMap::new();
@@ -565,67 +544,85 @@ fn merge_and_update_csv(file_path: &str, new_aggregates: &BTreeMap<u64, AggTrade
     let mut writer = csv::Writer::from_writer(file);
     writer.write_record(&["timestamp", "start_atid", "end_atid", "net_flow"])?;
     for rec in merged {
-        let net_flow_str = format!("{:.2}", rec.net_flow);
-        let parts: Vec<&str> = net_flow_str.split('.').collect();
-        let int_part = parts[0].parse::<i64>().unwrap_or(0);
-        let formatted_int = int_part.to_formatted_string(&Locale::en);
-        let net_flow_formatted = if parts.len() > 1 {
-            format!("{}.{}", formatted_int, parts[1])
-        } else {
-            formatted_int
-        };
         writer.write_record(&[
             rec.timestamp.to_string(),
             rec.start_atid.to_string(),
             rec.end_atid.to_string(),
-            net_flow_formatted,
+            format_net_flow(rec.net_flow),
         ])?;
     }
     writer.flush()?;
     Ok(())
 }
 
-async fn process_csv_file(
-    file_path: &str,
-    symbol: &str,
+fn read_csv_records(file_path: &str) -> Result<Vec<CsvRecord>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut reader = csv::Reader::from_path(file_path)?;
+    let mut records = Vec::new();
+    for result in reader.deserialize() {
+        let record: CsvRecord = result?;
+        records.push(record);
+    }
+    Ok(records)
+}
+
+fn scan_csv_for_gaps(file_path: &str) -> Result<(u64, Vec<(u64, u64)>), Box<dyn std::error::Error + Send + Sync>> {
+    let records = read_csv_records(file_path)?;
+    let mut gaps = Vec::new();
+    let mut prev_end: Option<u64> = None;
+    let mut checkpoint = 0;
+    for record in records.iter() {
+        if let Some(prev) = prev_end {
+            if record.start_atid > prev + 1 {
+                gaps.push((prev + 1, record.start_atid - 1));
+            }
+        }
+        prev_end = Some(record.end_atid);
+        checkpoint = record.end_atid;
+    }
+    Ok((checkpoint, gaps))
+}
+
+// process_csv_file now takes owned Strings and returns a 'static future.
+fn process_csv_file(
+    file_path: String,
+    symbol: String,
     market: MarketType,
     http_client: reqwest::Client,
     rate_limiter: Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>,
     log_buffer: Arc<Mutex<VecDeque<String>>>,
-) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-    let (checkpoint, gaps) = scan_csv_for_gaps(file_path)?;
-    if gaps.is_empty() {
-        return Ok(checkpoint);
-    }
-    let mut combined_missing_trades = Vec::new();
-    for (missing_start, missing_end) in gaps {
-        push_log(&log_buffer, format!("Identified data gaps in {} {}: {} to {}", market_str_short(market), symbol, missing_start, missing_end)).await;
-        let mut retry_delay = Duration::from_secs(5);
-        loop {
-            match fetch_missing_agg_trades(&http_client, symbol, market, missing_start, missing_end, rate_limiter.clone()).await {
-                Ok(trades) => {
-                    combined_missing_trades.extend(trades);
-                    break;
-                }
-                Err(e) => {
-                    push_log(&log_buffer, format!("Error fetching missing trades for {} {}: {}. Retrying in {} seconds...", market_str(market), symbol, e, retry_delay.as_secs())).await;
-                    if e.to_string().contains("429") {
-                        retry_delay = std::cmp::min(retry_delay * 2, Duration::from_secs(60));
-                    } else {
-                        retry_delay = Duration::from_secs(5);
+) -> impl std::future::Future<Output = Result<u64, Box<dyn std::error::Error + Send + Sync>>> + 'static {
+    async move {
+        let (checkpoint, gaps) = scan_csv_for_gaps(&file_path)?;
+        if gaps.is_empty() {
+            return Ok(checkpoint);
+        }
+        let mut combined_missing_trades = Vec::new();
+        for (missing_start, missing_end) in gaps {
+            push_log(&log_buffer, format!("Identified data gaps in {} {}: {} to {}", market_str_short(market), symbol, missing_start, missing_end)).await;
+            let mut retry_delay = Duration::from_secs(5);
+            loop {
+                match fetch_missing_agg_trades(&http_client, &symbol, market, missing_start, missing_end, rate_limiter.clone()).await {
+                    Ok(trades) => {
+                        combined_missing_trades.extend(trades);
+                        break;
                     }
-                    tokio::time::sleep(retry_delay).await;
+                    Err(e) => {
+                        push_log(&log_buffer, format!("Error fetching missing trades for {} {}: {}. Retrying in {} seconds...", market_str(market), symbol, e, retry_delay.as_secs())).await;
+                        if e.to_string().contains("429") {
+                            retry_delay = std::cmp::min(retry_delay * 2, Duration::from_secs(60));
+                        } else {
+                            retry_delay = Duration::from_secs(5);
+                        }
+                        tokio::time::sleep(retry_delay).await;
+                    }
                 }
             }
         }
+        let new_aggregates = aggregate_missing_trades(&combined_missing_trades);
+        merge_and_update_csv(&file_path, &new_aggregates)?;
+        let (new_checkpoint, _) = scan_csv_for_gaps(&file_path)?;
+        Ok(new_checkpoint)
     }
-    combined_missing_trades.shrink_to_fit();
-    let new_aggregates = aggregate_missing_trades(&combined_missing_trades);
-    drop(combined_missing_trades);
-    merge_and_update_csv(file_path, &new_aggregates)?;
-    drop(new_aggregates);
-    let (new_checkpoint, _) = scan_csv_for_gaps(file_path)?;
-    Ok(new_checkpoint)
 }
 
 fn update_checkpoint_file(checkpoints: &BTreeMap<String, u64>, checkpoint_file: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -651,7 +648,7 @@ async fn ui_render_loop(
     spot_symbols_list: Arc<Mutex<Vec<String>>>,
     next_symbol_refresh_time: Arc<Mutex<SystemTime>>,
     log_buffer: Arc<Mutex<VecDeque<String>>>,
-) -> crossterm::Result<()> {
+) -> std::io::Result<()> {
     let mut stdout = stdout();
     loop {
         let (cols, rows) = terminal_size()?;
@@ -699,24 +696,22 @@ async fn ui_render_loop(
 }
 
 // ------------------------
-// Main entry point
+// Main Entry Point
 // ------------------------
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> std::io::Result<()> {
     let mut stdout = stdout();
     stdout.execute(EnterAlternateScreen)?;
     
     // Create shared log buffer.
     let log_buffer = Arc::new(Mutex::new(VecDeque::new()));
-
-    // Clone for UI spawn.
     let ui_log_buffer = log_buffer.clone();
 
     // Process command-line arguments.
     let args: Vec<String> = env::args().collect();
     let mut disable_api_log = false;
-    for arg in args.iter().skip(1) { // Skip the program name
+    for arg in args.iter().skip(1) {
         match arg.as_str() {
             "--disable-api-log" => disable_api_log = true,
             _ => {
@@ -732,12 +727,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     push_log(&log_buffer, "Initializing Binance USDT aggregated trade data stream...".to_string()).await;
 
-    let process_start_unix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let process_start_unix = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock is before UNIX EPOCH").as_secs();
+
     let next_minute_boundary = ((process_start_unix / 60) + 1) * 60;
     push_log(&log_buffer, format!("Process start UNIX time: {}. Next full minute boundary: {}", process_start_unix, next_minute_boundary)).await;
 
     let (trade_data_sender, mut trade_data_receiver) = mpsc::channel::<(MarketType, AggTrade)>(MAX_BUFFERED_RECORDS);
-
     let trade_aggregates = Arc::new(Mutex::new(BTreeMap::<(String, MarketType, u64), AggTradeAggregate>::new()));
     let csv_writers = Arc::new(Mutex::new(HashMap::new()));
     let agg_trade_tracker = Arc::new(Mutex::new(AggTradeTracker::new()));
@@ -798,18 +793,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 tokio::select! {
                     Some((market, trade_data)) = trade_data_receiver.recv() => {
-                        let trade_time_sec = trade_data.trade_timestamp / 1000;
+                        // Destructure the incoming trade to avoid repeated cloning of the symbol.
+                        let AggTrade { s, p, q, m, agg_trade_id, trade_timestamp, _extra } = trade_data;
+                        let trade_time_sec = trade_timestamp / 1000;
                         let trade_minute = (trade_time_sec / 60) * 60;
                         if trade_minute < start_minute_boundary {
                             continue;
                         }
-                        let price: f64 = trade_data.p.parse().unwrap_or(0.0);
-                        let quantity: f64 = trade_data.q.parse().unwrap_or(0.0);
-                        let net_flow = if trade_data.m { -price * quantity } else { price * quantity };
+                        let price: f64 = p.parse().unwrap_or(0.0);
+                        let quantity: f64 = q.parse().unwrap_or(0.0);
+                        let net_flow = if m { -price * quantity } else { price * quantity };
 
+                        // Clone the symbol once for use as a key.
+                        let symbol_for_key = s.clone();
                         {
                             let mut aggregates_lock = trade_aggregates.lock().await;
-                            let aggregate_entry = aggregates_lock.entry((trade_data.s.clone(), market, trade_minute))
+                            let aggregate_entry = aggregates_lock.entry((symbol_for_key, market, trade_minute))
                                 .or_insert(AggTradeAggregate {
                                     net_flow: 0.0,
                                     start_atid: None,
@@ -818,22 +817,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 });
                             aggregate_entry.net_flow += net_flow;
                             aggregate_entry.count += 1;
-                            if aggregate_entry.start_atid.is_none() || trade_data.agg_trade_id < aggregate_entry.start_atid.unwrap() {
-                                aggregate_entry.start_atid = Some(trade_data.agg_trade_id);
+                            if aggregate_entry.start_atid.is_none() || agg_trade_id < aggregate_entry.start_atid.unwrap() {
+                                aggregate_entry.start_atid = Some(agg_trade_id);
                             }
-                            if aggregate_entry.end_atid.is_none() || trade_data.agg_trade_id > aggregate_entry.end_atid.unwrap() {
-                                aggregate_entry.end_atid = Some(trade_data.agg_trade_id);
+                            if aggregate_entry.end_atid.is_none() || agg_trade_id > aggregate_entry.end_atid.unwrap() {
+                                aggregate_entry.end_atid = Some(agg_trade_id);
                             }
                         }
                         metrics_clone.current_batch_records.fetch_add(1, Ordering::Relaxed);
 
                         let mut tracker_lock = agg_trade_tracker.lock().await;
-                        if let Some((missing_start, missing_end)) = tracker_lock.check_and_update(&trade_data.s, market, trade_data.agg_trade_id) {
-                            push_log(&proc_log_buffer, format!("Detected gap in {} {}: {} to {}", market_str(market), trade_data.s, missing_start, missing_end)).await;
+                        if let Some((missing_start, missing_end)) = tracker_lock.check_and_update(&s, market, agg_trade_id) {
+                            push_log(&proc_log_buffer, format!("Detected gap in {} {}: {} to {}", market_str(market), s, missing_start, missing_end)).await;
                             metrics_clone.missing_gaps.fetch_add(1, Ordering::Relaxed);
                             metrics_clone.gaps_in_queue.fetch_add(1, Ordering::Relaxed);
                             let http_client_inner = http_client.clone();
-                            let symbol_clone = trade_data.s.clone();
+                            let symbol_for_fetch = s.clone();
                             let rate_limiter = match market {
                                 MarketType::Futures => futures_rate_limiter.clone(),
                                 MarketType::Spot => spot_rate_limiter.clone(),
@@ -844,7 +843,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             tokio::spawn(async move {
                                 let mut retry_delay = Duration::from_secs(5);
                                 loop {
-                                    match fetch_missing_agg_trades(&http_client_inner, &symbol_clone, market, missing_start, missing_end, rate_limiter.clone()).await {
+                                    match fetch_missing_agg_trades(&http_client_inner, &symbol_for_fetch, market, missing_start, missing_end, rate_limiter.clone()).await {
                                         Ok(trades) => {
                                             for trade in trades {
                                                 if let Err(e) = missing_trade_sender_clone.send((market, trade)).await {
@@ -913,7 +912,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         minute_ts.to_string(),
                                         aggregate.start_atid.unwrap_or(0).to_string(),
                                         aggregate.end_atid.unwrap_or(0).to_string(),
-                                        format!("{:.2}", aggregate.net_flow),
+                                        format_net_flow(aggregate.net_flow),
                                     ]).expect("Failed to write CSV record");
                                     writer_entry.writer.flush().expect("Failed to flush CSV writer");
                                 }
@@ -956,12 +955,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut spot_list_lock = spot_symbols_list.lock().await;
             *spot_list_lock = spot_symbols_fetched.clone();
         }
-        {
-            spawn_ws_connections(MarketType::Futures, futures_symbols_fetched, ws_trade_sender.clone(), websocket_semaphore.clone(), &futures_ws_version_tx, ws_log_buffer.clone()).await;
-        }
-        {
-            spawn_ws_connections(MarketType::Spot, spot_symbols_fetched, ws_trade_sender.clone(), websocket_semaphore.clone(), &spot_ws_version_tx, ws_log_buffer.clone()).await;
-        }
+        spawn_ws_connections(MarketType::Futures, futures_symbols_fetched, ws_trade_sender.clone(), websocket_semaphore.clone(), &futures_ws_version_tx, ws_log_buffer.clone()).await;
+        spawn_ws_connections(MarketType::Spot, spot_symbols_fetched, ws_trade_sender.clone(), websocket_semaphore.clone(), &spot_ws_version_tx, ws_log_buffer.clone()).await;
     }
 
     {
@@ -993,7 +988,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     {
-        // Clone separate instances for each inner spawn block.
         let http_client_for_futures = http_client.clone();
         let futures_rate_limiter_for_futures = futures_rate_limiter.clone();
         let checkpoint_log_buffer_for_futures = log_buffer.clone();
@@ -1021,13 +1015,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let http_client = http_client_for_futures.clone();
                             let checkpoint_log_buffer = checkpoint_log_buffer_for_futures.clone();
                             let task = tokio::spawn(async move {
-                                match process_csv_file(&file_path, &symbol, MarketType::Futures, http_client, rate_limiter, checkpoint_log_buffer.clone()).await {
+                                match process_csv_file(file_path, symbol.clone(), MarketType::Futures, http_client, rate_limiter, checkpoint_log_buffer.clone()).await {
                                     Ok(new_checkpoint) => {
                                         push_log(&checkpoint_log_buffer, format!("Data gaps filled. Checkpoint updated for {} {} to {}", market_str_short(MarketType::Futures), symbol, new_checkpoint)).await;
                                         Some((format!("{}:{}", symbol, market_str(MarketType::Futures)), new_checkpoint))
                                     },
                                     Err(e) => {
-                                        push_log(&checkpoint_log_buffer, format!("Error processing file {}: {}", file_path, e)).await;
+                                        push_log(&checkpoint_log_buffer, format!("Error processing file {}: {}", path.to_str().unwrap(), e)).await;
                                         None
                                     }
                                 }
@@ -1057,13 +1051,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let http_client = http_client_for_spot.clone();
                             let checkpoint_log_buffer = checkpoint_log_buffer_for_spot.clone();
                             let task = tokio::spawn(async move {
-                                match process_csv_file(&file_path, &symbol, MarketType::Spot, http_client, rate_limiter, checkpoint_log_buffer.clone()).await {
+                                match process_csv_file(file_path, symbol.clone(), MarketType::Spot, http_client, rate_limiter, checkpoint_log_buffer.clone()).await {
                                     Ok(new_checkpoint) => {
                                         push_log(&checkpoint_log_buffer, format!("Data gaps filled. Checkpoint updated for {} {} to {}", market_str_short(MarketType::Spot), symbol, new_checkpoint)).await;
                                         Some((format!("{}:{}", symbol, market_str(MarketType::Spot)), new_checkpoint))
                                     },
                                     Err(e) => {
-                                        push_log(&checkpoint_log_buffer, format!("Error processing file {}: {}", file_path, e)).await;
+                                        push_log(&checkpoint_log_buffer, format!("Error processing file {}: {}", path.to_str().unwrap(), e)).await;
                                         None
                                     }
                                 }
